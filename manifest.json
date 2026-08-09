@@ -1,0 +1,43 @@
+{
+  "display_information": {
+    "name": "Bday Bot",
+    "description": "Invite a channel to secretly plan a birthday for one of its members",
+    "background_color": "#611f69"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "bday-bot",
+      "always_online": true
+    },
+    "slash_commands": [
+      {
+        "command": "/bday",
+        "description": "Invite a channel to plan a birthday",
+        "usage_hint": "invite #channel @birthday-person",
+        "should_escape": true
+      }
+    ]
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "commands",
+        "chat:write",
+        "im:write",
+        "channels:read",
+        "groups:read",
+        "channels:manage",
+        "groups:write",
+        "users:read"
+      ]
+    }
+  },
+  "settings": {
+    "interactivity": {
+      "is_enabled": true
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": true,
+    "token_rotation_enabled": false
+  }
+}

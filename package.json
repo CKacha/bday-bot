@@ -1,0 +1,14 @@
+{
+  "name": "bday-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Slack bot to invite people to birthday card/planning channels",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "@slack/bolt": "^3.21.4",
+    "dotenv": "^16.4.5"
+  }
+}

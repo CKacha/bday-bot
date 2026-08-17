@@ -1,5 +1,8 @@
 require('dotenv').config();
+const http = require('http');
 const { App, LogLevel } = require('@slack/bolt');
+const { WebClient } = require('@slack/web-api');
+const tokenStore = require('./tokenStore');
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -8,6 +11,84 @@ const app = new App({
   socketMode: true,
   logLevel: LogLevel.DEBUG,
 });
+
+// part to self generate user token for private channels 
+const OAUTH_PORT = process.env.PORT || 3000;
+const OAUTH_REDIRECT_URI = process.env.SLACK_REDIRECT_URI;
+const CONNECT_URL =
+  OAUTH_REDIRECT_URI && process.env.SLACK_CLIENT_ID
+    ? `https://slack.com/oauth/v2/authorize?client_id=${process.env.SLACK_CLIENT_ID}` +
+      `&user_scope=groups:read,channels:read&redirect_uri=${encodeURIComponent(OAUTH_REDIRECT_URI)}`
+    : null;
+const README_URL = 'https://github.com/CKacha/bday-bot#readme';
+
+function getUserClient(userId) {
+  // only for testing idk remove it later mayhsps
+  const token = tokenStore.get(userId) || process.env.SLACK_USER_TOKEN;
+  return token ? new WebClient(token) : null;
+}
+
+async function fetchChannelContext(botClient, inviterId, channelId) {
+  const userClient = getUserClient(inviterId);
+  const reader = userClient || botClient;
+  try {
+    const info = await reader.conversations.info({ channel: channelId });
+    const members = await getChannelMembers(reader, channelId);
+    return { info, members };
+  } catch (err) {
+    const code = err.data ? err.data.error : err.message;
+    const missingAccess = ['channel_not_found', 'not_in_channel', 'missing_scope'].includes(code);
+    if (!userClient && CONNECT_URL && missingAccess) {
+      const needsConnectErr = new Error('needs_connect');
+      needsConnectErr.needsConnect = true;
+      throw needsConnectErr;
+    }
+    throw err;
+  }
+}
+
+http
+  .createServer(async (req, res) => {
+    const url = new URL(req.url, `http://localhost:${OAUTH_PORT}`);
+
+    if (url.pathname !== '/slack/oauth/callback') {
+      res.writeHead(404);
+      res.end('Not found');
+      return;
+    }
+
+    const code = url.searchParams.get('code');
+    if (!code) {
+      res.writeHead(400);
+      res.end('Missing code');
+      return;
+    }
+
+    try {
+      const result = await new WebClient().oauth.v2.access({
+        client_id: process.env.SLACK_CLIENT_ID,
+        client_secret: process.env.SLACK_CLIENT_SECRET,
+        code,
+        redirect_uri: OAUTH_REDIRECT_URI,
+      });
+      const userId = result.authed_user && result.authed_user.id;
+      const userToken = result.authed_user && result.authed_user.access_token;
+      if (!userId || !userToken) {
+        res.writeHead(400);
+        res.end("Slack didn't return a user token. Make sure the app requests user scopes.");
+        return;
+      }
+      tokenStore.set(userId, userToken);
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end('<html><body>Connected! You can close this tab and go back to Slack.</body></html>');
+    } catch (err) {
+      res.writeHead(500);
+      res.end('Something went wrong connecting your account.');
+    }
+  })
+  .listen(OAUTH_PORT, () => {
+    console.log(`OAuth callback server listening on port ${OAUTH_PORT}`);
+  });
 
 async function getChannelMembers(client, channelId) {
   const members = [];
@@ -108,16 +189,18 @@ function buildFormBlocks({ sourceChannelId, birthdayUserId, destChannelId, messa
   ];
 }
 
+// no tweeking okease
+const notifiedAccessFailures = new Set();
+
 async function buildPreviewBlocks(client, { sourceChannelId, birthdayUserId, inviterId, messageInput }) {
   if (!sourceChannelId) return [];
 
   const blocks = [{ type: 'divider' }];
 
   try {
-    const info = await client.conversations.info({ channel: sourceChannelId });
+    const { info, members } = await fetchChannelContext(client, inviterId, sourceChannelId);
     const sourceChannelName = info.channel.name;
 
-    const members = await getChannelMembers(client, sourceChannelId);
     const botIds = await getBotUserIds(client, members);
     const recipients = members.filter(
       (id) => id !== birthdayUserId && id !== inviterId && !botIds.has(id)
@@ -148,13 +231,71 @@ async function buildPreviewBlocks(client, { sourceChannelId, birthdayUserId, inv
       },
     });
   } catch (err) {
-    blocks.push({
-      type: 'section',
-      text: {
-        type: 'mrkdwn',
-        text: `:warning: Couldn't load a preview for that channel (${err.data ? err.data.error : err.message}). Make sure I've been invited to it.`,
-      },
-    });
+    const dmKey = `${inviterId}:${sourceChannelId}:${err.needsConnect ? 'connect' : 'error'}`;
+    const alreadyNotified = notifiedAccessFailures.has(dmKey);
+    notifiedAccessFailures.add(dmKey);
+
+    if (err.needsConnect) {
+      blocks.push({
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text:
+            ":lock: That's a private channel I'm not in. Connect your Slack account so I can read " +
+            "its members without joining it — reselect the channel here afterward to refresh this preview.",
+        },
+      });
+      blocks.push({
+        type: 'actions',
+        elements: [
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: 'Connect your Slack account' },
+            url: CONNECT_URL,
+            action_id: 'connect_account',
+          },
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: 'View setup docs' },
+            url: README_URL,
+            action_id: 'view_readme',
+          },
+        ],
+      });
+      if (!alreadyNotified) {
+        await client.chat.postMessage({
+          channel: inviterId,
+          text:
+            `:lock: <#${sourceChannelId}> is a private channel I'm not in. Connect your Slack account, ` +
+            `then reselect the channel in the /bday modal: ${CONNECT_URL}\nSetup docs: ${README_URL}`,
+        });
+      }
+    } else {
+      blocks.push({
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `:warning: Couldn't load a preview for that channel (${err.data ? err.data.error : err.message}). Make sure I've been invited to it.`,
+        },
+      });
+      if (!alreadyNotified) {
+        await client.chat.postMessage({
+          channel: inviterId,
+          text: `:warning: I couldn't read <#${sourceChannelId}>: ${err.data ? err.data.error : err.message}\nSetup docs: ${README_URL}`,
+        });
+      }
+      blocks.push({
+        type: 'actions',
+        elements: [
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: 'View setup docs' },
+            url: README_URL,
+            action_id: 'view_readme',
+          },
+        ],
+      });
+    }
   }
 
   return blocks;
@@ -225,6 +366,14 @@ app.action('bday_select', async ({ ack, body, client }) => {
   await refreshModal(body, client);
 });
 
+app.action('connect_account', async ({ ack }) => {
+  await ack();
+});
+
+app.action('view_readme', async ({ ack }) => {
+  await ack();
+});
+
 app.view('bday_confirm', async ({ ack, view, client, body }) => {
   const inviterId = body.user.id;
   const { sourceChannelId, birthdayUserId, destChannelId, messageInput } = readFormState(
@@ -244,29 +393,29 @@ app.view('bday_confirm', async ({ ack, view, client, body }) => {
   await ack();
 
   let sourceChannelName;
+  let members;
   try {
-    const info = await client.conversations.info({ channel: sourceChannelId });
-    sourceChannelName = info.channel.name;
+    const ctx = await fetchChannelContext(client, inviterId, sourceChannelId);
+    sourceChannelName = ctx.info.channel.name;
+    members = ctx.members;
   } catch (err) {
-    await client.chat.postMessage({
-      channel: inviterId,
-      text: `I couldn't look up that channel. Make sure I've been invited to it first. (${err.data ? err.data.error : err.message})`,
-    });
+    if (err.needsConnect) {
+      await client.chat.postMessage({
+        channel: inviterId,
+        text:
+          `:lock: <#${sourceChannelId}> is a private channel I'm not in. Connect your Slack account, ` +
+          `then run /bday again: ${CONNECT_URL}\nSetup docs: ${README_URL}`,
+      });
+    } else {
+      await client.chat.postMessage({
+        channel: inviterId,
+        text: `I couldn't read <#${sourceChannelId}>: ${err.data ? err.data.error : err.message}\nSetup docs: ${README_URL}`,
+      });
+    }
     return;
   }
 
   const messageText = (messageInput || '').trim() || defaultMessage(birthdayUserId, inviterId);
-
-  let members;
-  try {
-    members = await getChannelMembers(client, sourceChannelId);
-  } catch (err) {
-    await client.chat.postMessage({
-      channel: inviterId,
-      text: `I couldn't read the member list for <#${sourceChannelId}>: ${err.data ? err.data.error : err.message}`,
-    });
-    return;
-  }
 
   const botIds = await getBotUserIds(client, members);
   const toMessage = members.filter(

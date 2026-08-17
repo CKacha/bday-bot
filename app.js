@@ -1,15 +1,13 @@
 require('dotenv').config();
-const { App } = require('@slack/bolt');
+const { App, LogLevel } = require('@slack/bolt');
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   appToken: process.env.SLACK_APP_TOKEN,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
   socketMode: true,
+  logLevel: LogLevel.DEBUG,
 });
-
-const CHANNEL_MENTION = /<#([CGD][A-Z0-9]+)(?:\|([^>]*))?>/;
-const USER_MENTION = /<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/;
 
 async function getChannelMembers(client, channelId) {
   const members = [];
@@ -22,115 +20,216 @@ async function getChannelMembers(client, channelId) {
   return members;
 }
 
-function defaultMessage(birthdayUserId) {
+async function getBotUserIds(client, userIds) {
+  const botIds = new Set(['USLACKBOT']);
+  for (const userId of userIds) {
+    if (botIds.has(userId)) continue;
+    try {
+      const resp = await client.users.info({ user: userId });
+      if (resp.user && resp.user.is_bot) botIds.add(userId);
+    } catch (err) {
+      // error handeling should probably be sent as a dm
+      //do soon
+    }
+  }
+  return botIds;
+}
+
+function defaultMessage(birthdayUserId, inviterId) {
   return (
-    `:tada: Shh... it's almost <@${birthdayUserId}>'s birthday! ` +
+    `:tada: <@${inviterId}> sent you an invite for <@${birthdayUserId}>'s birthday! ` +
     `Want to help plan something special? Tap *Accept* below and I'll add you to the planning channel.`
   );
 }
 
-app.command('/bday', async ({ command, ack, client, respond }) => {
-  await ack();
+const MAX_PREVIEW_LISTED = 40;
 
-  const text = (command.text || '').trim();
-  const [sub, ...rest] = text.split(/\s+/);
+function buildFormBlocks({ sourceChannelId, birthdayUserId, destChannelId, messageInput }) {
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text:
+          'This will DM everyone in the channel you pick below (except the birthday ' +
+          'person) with an invite. Anyone who accepts gets added to the planning channel you designate.',
+      },
+    },
+    {
+      type: 'input',
+      block_id: 'source_block',
+      label: { type: 'plain_text', text: 'Channel to invite from' },
+      dispatch_action: true,
+      element: {
+        type: 'conversations_select',
+        action_id: 'source_select',
+        filter: { include: ['public', 'private'] },
+        ...(sourceChannelId ? { initial_conversation: sourceChannelId } : {}),
+      },
+    },
+    {
+      type: 'input',
+      block_id: 'bday_block',
+      label: { type: 'plain_text', text: "Who's the birthday person?" },
+      dispatch_action: true,
+      element: {
+        type: 'users_select',
+        action_id: 'bday_select',
+        ...(birthdayUserId ? { initial_user: birthdayUserId } : {}),
+      },
+    },
+    {
+      type: 'input',
+      block_id: 'dest_block',
+      label: { type: 'plain_text', text: 'Planning channel (the one you manage)' },
+      element: {
+        type: 'conversations_select',
+        action_id: 'dest_select',
+        filter: { include: ['public', 'private'], exclude_bot_users: true },
+        ...(destChannelId ? { initial_conversation: destChannelId } : {}),
+      },
+    },
+    {
+      type: 'input',
+      block_id: 'message_block',
+      label: { type: 'plain_text', text: 'Message to send' },
+      optional: true,
+      element: {
+        type: 'plain_text_input',
+        action_id: 'message_input',
+        multiline: true,
+        placeholder: {
+          type: 'plain_text',
+          text: 'Leave blank to use the default birthday invite message.',
+        },
+        ...(messageInput ? { initial_value: messageInput } : {}),
+      },
+    },
+  ];
+}
 
-  if (sub !== 'invite') {
-    await respond({
-      response_type: 'ephemeral',
-      text: 'Usage: `/bday invite #channel @birthday-person`',
-    });
-    return;
-  }
+async function buildPreviewBlocks(client, { sourceChannelId, birthdayUserId, inviterId, messageInput }) {
+  if (!sourceChannelId) return [];
 
-  const restText = rest.join(' ');
-  const channelMatch = restText.match(CHANNEL_MENTION);
-  const userMatch = restText.match(USER_MENTION);
+  const blocks = [{ type: 'divider' }];
 
-  if (!channelMatch || !userMatch) {
-    await respond({
-      response_type: 'ephemeral',
-      text: 'Usage: `/bday invite #channel @birthday-person` — mention one channel and one person.',
-    });
-    return;
-  }
-
-  const sourceChannelId = channelMatch[1];
-  const birthdayUserId = userMatch[1];
-
-  let sourceChannelName = channelMatch[2];
   try {
-    if (!sourceChannelName) {
-      const info = await client.conversations.info({ channel: sourceChannelId });
-      sourceChannelName = info.channel.name;
+    const info = await client.conversations.info({ channel: sourceChannelId });
+    const sourceChannelName = info.channel.name;
+
+    const members = await getChannelMembers(client, sourceChannelId);
+    const botIds = await getBotUserIds(client, members);
+    const recipients = members.filter(
+      (id) => id !== birthdayUserId && id !== inviterId && !botIds.has(id)
+    );
+
+    const messageText = birthdayUserId
+      ? (messageInput || '').trim() || defaultMessage(birthdayUserId, inviterId)
+      : null;
+
+    if (messageText) {
+      blocks.push({
+        type: 'section',
+        text: { type: 'mrkdwn', text: `*Preview — this is what recipients will receive:*\n${messageText}` },
+      });
     }
-  } catch (err) {
-    await respond({
-      response_type: 'ephemeral',
-      text: `I couldn't look up that channel. Make sure I've been invited to it first. (${err.data ? err.data.error : err.message})`,
+
+    const shown = recipients.slice(0, MAX_PREVIEW_LISTED);
+    const extra = recipients.length - shown.length;
+    const listText = shown.length
+      ? shown.map((id) => `• <@${id}>`).join('\n') + (extra > 0 ? `\n_...and ${extra} more_` : '')
+      : '_Nobody else in this channel to invite._';
+
+    blocks.push({
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `*The following ${recipients.length} ${recipients.length === 1 ? 'person' : 'people'} will be added (from #${sourceChannelName}):*\n${listText}`,
+      },
     });
-    return;
+  } catch (err) {
+    blocks.push({
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `:warning: Couldn't load a preview for that channel (${err.data ? err.data.error : err.message}). Make sure I've been invited to it.`,
+      },
+    });
   }
 
-  const metadata = JSON.stringify({
+  return blocks;
+}
+
+function readFormState(values) {
+  return {
+    sourceChannelId: values.source_block && values.source_block.source_select.selected_conversation,
+    birthdayUserId: values.bday_block && values.bday_block.bday_select.selected_user,
+    destChannelId: values.dest_block && values.dest_block.dest_select.selected_conversation,
+    messageInput: values.message_block && values.message_block.message_input.value,
+  };
+}
+
+async function refreshModal(body, client) {
+  const inviterId = body.user.id;
+  const { sourceChannelId, birthdayUserId, destChannelId, messageInput } = readFormState(
+    body.view.state.values
+  );
+
+  const previewBlocks = await buildPreviewBlocks(client, {
     sourceChannelId,
-    sourceChannelName,
     birthdayUserId,
-    inviterId: command.user_id,
+    inviterId,
+    messageInput,
   });
+
+  await client.views.update({
+    view_id: body.view.id,
+    hash: body.view.hash,
+    view: {
+      type: 'modal',
+      callback_id: 'bday_confirm',
+      title: { type: 'plain_text', text: 'Birthday invite' },
+      submit: { type: 'plain_text', text: 'Send invites' },
+      close: { type: 'plain_text', text: 'Cancel' },
+      blocks: [
+        ...buildFormBlocks({ sourceChannelId, birthdayUserId, destChannelId, messageInput }),
+        ...previewBlocks,
+      ],
+    },
+  });
+}
+
+app.command('/bday', async ({ command, ack, client }) => {
+  await ack();
 
   await client.views.open({
     trigger_id: command.trigger_id,
     view: {
       type: 'modal',
       callback_id: 'bday_confirm',
-      private_metadata: metadata,
       title: { type: 'plain_text', text: 'Birthday invite' },
       submit: { type: 'plain_text', text: 'Send invites' },
       close: { type: 'plain_text', text: 'Cancel' },
-      blocks: [
-        {
-          type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text:
-              `This will DM everyone in *#${sourceChannelName}* (except <@${birthdayUserId}>) ` +
-              `the message below. Anyone who accepts gets added to the planning channel you pick.`,
-          },
-        },
-        {
-          type: 'input',
-          block_id: 'message_block',
-          label: { type: 'plain_text', text: 'Message to send' },
-          element: {
-            type: 'plain_text_input',
-            action_id: 'value',
-            multiline: true,
-            initial_value: defaultMessage(birthdayUserId),
-          },
-        },
-        {
-          type: 'input',
-          block_id: 'dest_block',
-          label: { type: 'plain_text', text: 'Planning channel (the one you manage)' },
-          element: {
-            type: 'conversations_select',
-            action_id: 'value',
-            filter: { include: ['public', 'private'], exclude_bot_users: true },
-          },
-        },
-      ],
+      blocks: buildFormBlocks({}),
     },
   });
 });
 
-app.view('bday_confirm', async ({ ack, view, client, body }) => {
-  const { sourceChannelId, sourceChannelName, birthdayUserId, inviterId } = JSON.parse(
-    view.private_metadata
-  );
+app.action('source_select', async ({ ack, body, client }) => {
+  await ack();
+  await refreshModal(body, client);
+});
 
-  const destChannelId = view.state.values.dest_block.value.selected_conversation;
-  const messageText = view.state.values.message_block.value.value;
+app.action('bday_select', async ({ ack, body, client }) => {
+  await ack();
+  await refreshModal(body, client);
+});
+
+app.view('bday_confirm', async ({ ack, view, client, body }) => {
+  const inviterId = body.user.id;
+  const { sourceChannelId, birthdayUserId, destChannelId, messageInput } = readFormState(
+    view.state.values
+  );
 
   if (destChannelId === sourceChannelId) {
     await ack({
@@ -144,6 +243,20 @@ app.view('bday_confirm', async ({ ack, view, client, body }) => {
 
   await ack();
 
+  let sourceChannelName;
+  try {
+    const info = await client.conversations.info({ channel: sourceChannelId });
+    sourceChannelName = info.channel.name;
+  } catch (err) {
+    await client.chat.postMessage({
+      channel: inviterId,
+      text: `I couldn't look up that channel. Make sure I've been invited to it first. (${err.data ? err.data.error : err.message})`,
+    });
+    return;
+  }
+
+  const messageText = (messageInput || '').trim() || defaultMessage(birthdayUserId, inviterId);
+
   let members;
   try {
     members = await getChannelMembers(client, sourceChannelId);
@@ -155,7 +268,10 @@ app.view('bday_confirm', async ({ ack, view, client, body }) => {
     return;
   }
 
-  const toMessage = members.filter((id) => id !== birthdayUserId);
+  const botIds = await getBotUserIds(client, members);
+  const toMessage = members.filter(
+    (id) => id !== birthdayUserId && id !== inviterId && !botIds.has(id)
+  );
 
   const buttonValue = JSON.stringify({
     dest: destChannelId,
@@ -204,7 +320,7 @@ app.view('bday_confirm', async ({ ack, view, client, body }) => {
   }
 
   const summaryLines = [
-    `Sent birthday invites for <@${birthdayUserId}> to ${sent} ${sent === 1 ? 'person' : 'people'} in <#${sourceChannelId}> (#${sourceChannelName}).`,
+    `:yay: Successfully sent messages to ${sent} ${sent === 1 ? 'person' : 'people'} in <#${sourceChannelId}> (#${sourceChannelName}) for <@${birthdayUserId}>'s birthday.`,
   ];
   if (failures.length) {
     summaryLines.push(`Couldn't DM: ${failures.map((id) => `<@${id}>`).join(', ')}`);

@@ -13,7 +13,7 @@
       {
         "command": "/bday",
         "description": "Invite a channel to plan a birthday",
-        "usage_hint": "invite #channel @birthday-person",
+        "usage_hint": "",
         "should_escape": true
       }
     ]

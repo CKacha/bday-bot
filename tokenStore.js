@@ -22,4 +22,9 @@ function set(userId, token) {
   fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2));
 }
 
-module.exports = { get, set };
+function remove(userId) {
+  delete tokens[userId];
+  fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2));
+}
+
+module.exports = { get, set, remove };

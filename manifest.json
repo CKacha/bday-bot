@@ -11,8 +11,20 @@
     },
     "slash_commands": [
       {
-        "command": "/bday",
+        "command": "/bdaypheus",
         "description": "Invite a channel to plan a birthday",
+        "usage_hint": "",
+        "should_escape": true
+      },
+      {
+        "command": "/link-bdaypheus",
+        "description": "Connect your Slack account for private-channel invites",
+        "usage_hint": "",
+        "should_escape": true
+      },
+      {
+        "command": "/remove-bdaypheus",
+        "description": "Request removal of your connected Slack account",
         "usage_hint": "",
         "should_escape": true
       }
@@ -31,7 +43,8 @@
         "groups:read",
         "channels:manage",
         "groups:write",
-        "users:read"
+        "users:read",
+        "usergroups:read"
       ],
       "user": [
         "groups:read",

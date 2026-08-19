@@ -33,14 +33,54 @@ const CHAIN_ENABLED = Boolean(
 
 const ADMIN_SLACK_USER_ID = process.env.ADMIN_SLACK_USER_ID;
 
+// http routuing please work
+const botClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+let BOT_USER_ID = null;
+
+const OAUTH_FAILURE_ESCALATION_THRESHOLD = 3;
+let oauthFailureStreak = 0;
+
+async function reportOauthFailure(slackUserId, errorMsg) {
+  oauthFailureStreak += 1;
+
+  if (slackUserId) {
+    try {
+      await botClient.chat.postMessage({
+        channel: slackUserId,
+        text:
+          `:warning: Something went wrong connecting your Slack account: ${errorMsg}\n` +
+          'Try again with /link-bdaypheus. If it keeps failing, this has already been flagged for review.',
+      });
+    } catch (e) {
+      // best-effort — don't let a failed notification mask the original error
+    }
+  }
+
+  if (ADMIN_SLACK_USER_ID && oauthFailureStreak >= OAUTH_FAILURE_ESCALATION_THRESHOLD) {
+    try {
+      await botClient.chat.postMessage({
+        channel: ADMIN_SLACK_USER_ID,
+        text:
+          `:rotating_light: The Hack Club Auth / Slack OAuth connect flow has failed ` +
+          `${oauthFailureStreak} times in a row. Latest error: ${errorMsg}` +
+          (slackUserId ? ` (most recent requester: <@${slackUserId}>)` : ''),
+      });
+    } catch (e) {
+      // best-effort
+    }
+  }
+}
+
+function reportOauthSuccess() {
+  oauthFailureStreak = 0;
+}
+
 const README_URL = 'https://github.com/CKacha/bday-bot#readme';
 
 const CONSENT_WARNING =
-  ':warning: *Before you connect:* this grants access to the name, topic, and full member list ' +
-  "of *every private channel/group you're in* — not just the one you're inviting from (Slack " +
-  "doesn't allow scoping this to a single channel). It *cannot* post messages, read your DMs, or " +
-  'change anything. The access token is stored on the server running this bot until you revoke it ' +
-  '(Slack → your apps → Bday Bot → Remove), so treat it as a standing grant, not a one-time read.';
+  ':exclamation: *Small fyi:* by going through auth the bot will be using your slack user token to only read the members of ' +
+  'private channels you are a part of. Read the full info at the warning file on the repo. ' +
+  'You can revoke the token at any time by running /remove-bdaypheus ';
 
 // state -> { slackUserId, hackclubVerified, createdAt }
 const pendingConnections = new Map();
@@ -133,7 +173,7 @@ http
       const state = url.searchParams.get('state');
       const pending = state && getPendingConnection(state);
       if (!code || !pending) {
-        sendHtml(res, 400, 'This connection link expired or is invalid. Start over from the /bdaypheus modal.');
+        sendHtml(res, 400, 'This connection link expired or is invalid. Use /link-bdaypheus to start again.');
         return;
       }
 
@@ -152,6 +192,7 @@ http
         const tokenData = await tokenResp.json();
         if (!tokenResp.ok || !tokenData.access_token) {
           sendHtml(res, 400, "Hack Club Auth didn't confirm your identity. Please try again.");
+          await reportOauthFailure(pending.slackUserId, "Hack Club Auth didn't confirm identity");
           return;
         }
 
@@ -160,6 +201,7 @@ http
         res.end();
       } catch (err) {
         sendHtml(res, 500, 'Something went wrong verifying your Hack Club account.');
+        await reportOauthFailure(pending.slackUserId, `Hack Club token exchange threw: ${err.message}`);
       }
       return;
     }
@@ -175,7 +217,7 @@ http
         return;
       }
       if (CHAIN_ENABLED && (!pending || !pending.hackclubVerified)) {
-        sendHtml(res, 400, 'Hack Club verification is required first. Start over from the /bdaypheus modal.');
+        sendHtml(res, 400, 'Hack Club verification is required first. Use /link-bdaypheus to start again.');
         return;
       }
 
@@ -189,14 +231,17 @@ http
         const userId = result.authed_user && result.authed_user.id;
         const userToken = result.authed_user && result.authed_user.access_token;
         if (!userId || !userToken) {
-          sendHtml(res, 400, "Slack didn't return a user token. Make sure the app requests user scopes.");
+          sendHtml(res, 400, "Slack didn't return a user token. If this is a localhost version, amke sure the bot has user scopes enabled.");
+          await reportOauthFailure(pending && pending.slackUserId, "Slack didn't return a user token");
           return;
         }
         tokenStore.set(userId, userToken);
         if (state) pendingConnections.delete(state);
         sendHtml(res, 200, 'Connected! You can close this tab and go back to Slack.');
+        reportOauthSuccess();
       } catch (err) {
         sendHtml(res, 500, 'Something went wrong connecting your account.');
+        await reportOauthFailure(pending && pending.slackUserId, `Slack token exchange threw: ${err.message}`);
       }
       return;
     }
@@ -273,8 +318,8 @@ async function getUsergroupMembers(client, groupId) {
 
 function defaultMessage(birthdayUserId, inviterId) {
   return (
-    `:tada: <@${inviterId}> sent you an invite for <@${birthdayUserId}>'s birthday! ` +
-    `Want to help plan something special? Tap *Accept* below and I'll add you to the planning channel.`
+    `Hey! :tada: <@${inviterId}> has invited you to a channel for <@${birthdayUserId}>'s birthday! ` +
+    `Click *Accept* below and I'll add you to the planning channel.`
   );
 }
 
@@ -286,6 +331,7 @@ function buildFormBlocks({
   destChannelId,
   groupId,
   messageInput,
+  inviterId,
   usergroupOptions = [],
 }) {
   return [
@@ -365,9 +411,13 @@ function buildFormBlocks({
         multiline: true,
         placeholder: {
           type: 'plain_text',
-          text: 'Leave blank to use the default birthday invite message.',
+          text: 'Fills in automatically once you pick who this is for — feel free to edit it.',
         },
-        ...(messageInput ? { initial_value: messageInput } : {}),
+        ...(messageInput
+          ? { initial_value: messageInput }
+          : birthdayUserId
+          ? { initial_value: defaultMessage(birthdayUserId, inviterId) }
+          : {}),
       },
     },
   ];
@@ -418,7 +468,7 @@ async function buildPreviewBlocks(
     if (messageText) {
       blocks.push({
         type: 'section',
-        text: { type: 'mrkdwn', text: `*Preview — this is what recipients will receive:*\n${messageText}` },
+        text: { type: 'mrkdwn', text: `*Preview: this is what recipients will receive:*\n${messageText}` },
       });
     }
 
@@ -451,9 +501,8 @@ async function buildPreviewBlocks(
         text: {
           type: 'mrkdwn',
           text:
-            ":lock: That's a private channel I'm not in. I've sent you a DM with how to connect your " +
-            "Slack account — reselect the channel here afterward to refresh this preview, or hit " +
-            "Cancel above to close this.",
+            ":lock: That's a private channel this bot is not in. I've sent you a DM with how to connect your " +
+            "Slack account. Once you connect, try again! "
         },
       });
 
@@ -468,7 +517,7 @@ async function buildPreviewBlocks(
                 type: 'mrkdwn',
                 text:
                   `:lock: <#${sourceChannelId}> is a private channel I'm not in. Connect your Slack account ` +
-                  "(you'll verify with Hack Club Auth first), then reselect the channel in the /bdaypheus modal.",
+                  "(you'll verify with Hack Club Auth first) with /link-bdaypheus, or the dm that I sent you.",
               },
             },
             {
@@ -500,7 +549,7 @@ async function buildPreviewBlocks(
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: `:warning: Couldn't load a preview for that channel (${err.data ? err.data.error : err.message}). Make sure I've been invited to it.`,
+          text: `:warning: Couldn't load a preview for that channel (${err.data ? err.data.error : err.message}). Make sure ${BOT_USER_ID ? `<@${BOT_USER_ID}>` : '@bdaypheus'} has been invited to it.`,
         },
       });
       if (!alreadyNotified) {
@@ -557,7 +606,7 @@ async function refreshModal(body, client) {
       submit: { type: 'plain_text', text: 'Send invites' },
       close: { type: 'plain_text', text: 'Cancel' },
       blocks: [
-        ...buildFormBlocks({ sourceChannelId, birthdayUserId, destChannelId, groupId, messageInput, usergroupOptions }),
+        ...buildFormBlocks({ sourceChannelId, birthdayUserId, destChannelId, groupId, messageInput, inviterId, usergroupOptions }),
         ...previewBlocks,
       ],
     },
@@ -577,7 +626,7 @@ app.command('/bdaypheus', async ({ command, ack, client }) => {
       title: { type: 'plain_text', text: 'Birthday invite' },
       submit: { type: 'plain_text', text: 'Send invites' },
       close: { type: 'plain_text', text: 'Cancel' },
-      blocks: buildFormBlocks({ usergroupOptions }),
+      blocks: buildFormBlocks({ inviterId: command.user_id, usergroupOptions }),
     },
   });
 });
@@ -596,14 +645,14 @@ app.command('/link-bdaypheus', async ({ command, ack, respond }) => {
   if (tokenStore.get(command.user_id)) {
     await respond({
       response_type: 'ephemeral',
-      text: "You're already connected — no need to do this again! I'll use that connection automatically next time I need to read a private channel you're in.",
+      text: "You're already connected! I'll use that connection automatically next time I need to read a private channel you're in.",
       blocks: [
         {
           type: 'section',
           text: {
             type: 'mrkdwn',
             text:
-              ":white_check_mark: You're already connected — no need to do this again! I'll use it " +
+              ":white_check_mark: You're already connected! No need to do this again! I'll use it " +
               "automatically the next time I need to read a private channel you're in.",
           },
         },
@@ -641,7 +690,7 @@ app.command('/link-bdaypheus', async ({ command, ack, respond }) => {
         text: {
           type: 'mrkdwn',
           text:
-            'Connect your Slack account so I can read private channels you\'re in — ' +
+            'Connect your Slack account so I can read private channels you\'re in ' +
             "you'll verify with Hack Club Auth first, then grant Slack access.",
         },
       },
@@ -733,11 +782,11 @@ app.action('remove_token_approve', async ({ ack, body, client, action }) => {
   await client.chat.update({
     channel: body.channel.id,
     ts: body.message.ts,
-    text: `:white_check_mark: Approved — removed <@${requesterId}>'s token.`,
+    text: `:white_check_mark: Approved | removed <@${requesterId}>'s token.`,
     blocks: [
       {
         type: 'section',
-        text: { type: 'mrkdwn', text: `:white_check_mark: Approved — removed <@${requesterId}>'s token.` },
+        text: { type: 'mrkdwn', text: `:white_check_mark: Approved | removed <@${requesterId}>'s token.` },
       },
     ],
   });
@@ -1031,6 +1080,9 @@ app.action('bday_decline', async ({ ack, body, client }) => {
 });
 
 (async () => {
+  const auth = await botClient.auth.test();
+  BOT_USER_ID = auth.user_id;
+
   await app.start();
   console.log('bday-bot is running (Socket Mode)');
 })();

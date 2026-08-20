@@ -23,8 +23,8 @@
         "should_escape": true
       },
       {
-        "command": "/remove-bdaypheus",
-        "description": "Request removal of your connected Slack account",
+        "command": "/unlink-bdaypheus",
+        "description": "Unlink your connected Slack account",
         "usage_hint": "",
         "should_escape": true
       }

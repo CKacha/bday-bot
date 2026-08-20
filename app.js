@@ -80,7 +80,7 @@ const README_URL = 'https://github.com/CKacha/bday-bot#readme';
 const CONSENT_WARNING =
   ':exclamation: *Small fyi:* by going through auth the bot will be using your slack user token to only read the members of ' +
   'private channels you are a part of. Read the full info at the warning file on the repo. ' +
-  'You can revoke the token at any time by running /remove-bdaypheus ';
+  'You can revoke the token at any time by running /unlink-bdaypheus ';
 
 // state -> { slackUserId, hackclubVerified, createdAt }
 const pendingConnections = new Map();
@@ -713,149 +713,22 @@ app.command('/link-bdaypheus', async ({ command, ack, respond }) => {
   });
 });
 
-app.command('/remove-bdaypheus', async ({ command, ack, client, respond }) => {
+app.command('/unlink-bdaypheus', async ({ command, ack, respond }) => {
   await ack();
-
-  if (!ADMIN_SLACK_USER_ID) {
-    await respond({
-      response_type: 'ephemeral',
-      text: "Token removal isn't configured yet (missing ADMIN_SLACK_USER_ID).",
-    });
-    return;
-  }
 
   if (!tokenStore.get(command.user_id)) {
     await respond({
       response_type: 'ephemeral',
-      text: "You don't have a connected Slack account to remove.",
+      text: "You don't have a connected Slack account to unlink.",
     });
     return;
   }
 
-  await client.chat.postMessage({
-    channel: ADMIN_SLACK_USER_ID,
-    text: `<@${command.user_id}> is requesting to remove their connected Slack account (token).`,
-    blocks: [
-      {
-        type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `:key: <@${command.user_id}> is requesting to remove their connected Slack account (token).`,
-        },
-      },
-      {
-        type: 'actions',
-        block_id: 'remove_token_decision',
-        elements: [
-          {
-            type: 'button',
-            text: { type: 'plain_text', text: 'Approve' },
-            style: 'primary',
-            action_id: 'remove_token_approve',
-            value: JSON.stringify({ requesterId: command.user_id }),
-          },
-          {
-            type: 'button',
-            text: { type: 'plain_text', text: 'Reject' },
-            style: 'danger',
-            action_id: 'remove_token_reject',
-            value: JSON.stringify({ requesterId: command.user_id }),
-          },
-        ],
-      },
-    ],
-  });
+  tokenStore.remove(command.user_id);
 
   await respond({
     response_type: 'ephemeral',
-    text: "Your removal request has been sent for approval. You'll get a DM once it's decided.",
-  });
-});
-
-app.action('remove_token_approve', async ({ ack, body, client, action }) => {
-  await ack();
-  if (body.user.id !== ADMIN_SLACK_USER_ID) return;
-
-  const { requesterId } = JSON.parse(action.value);
-  tokenStore.remove(requesterId);
-
-  await client.chat.update({
-    channel: body.channel.id,
-    ts: body.message.ts,
-    text: `:white_check_mark: Approved | removed <@${requesterId}>'s token.`,
-    blocks: [
-      {
-        type: 'section',
-        text: { type: 'mrkdwn', text: `:white_check_mark: Approved | removed <@${requesterId}>'s token.` },
-      },
-    ],
-  });
-
-  await client.chat.postMessage({
-    channel: requesterId,
-    text: ':white_check_mark: Your connected Slack account (token) was removed, as requested.',
-  });
-});
-
-app.action('remove_token_reject', async ({ ack, body, client, action }) => {
-  await ack();
-  if (body.user.id !== ADMIN_SLACK_USER_ID) return;
-
-  const { requesterId } = JSON.parse(action.value);
-
-  await client.views.open({
-    trigger_id: body.trigger_id,
-    view: {
-      type: 'modal',
-      callback_id: 'remove_reject_modal',
-      private_metadata: JSON.stringify({
-        requesterId,
-        channel: body.channel.id,
-        ts: body.message.ts,
-      }),
-      title: { type: 'plain_text', text: 'Reject removal' },
-      submit: { type: 'plain_text', text: 'Send' },
-      close: { type: 'plain_text', text: 'Cancel' },
-      blocks: [
-        {
-          type: 'input',
-          block_id: 'reason_block',
-          label: { type: 'plain_text', text: `Reason for rejecting <@${requesterId}>'s request` },
-          element: {
-            type: 'plain_text_input',
-            action_id: 'reason_input',
-            multiline: true,
-          },
-        },
-      ],
-    },
-  });
-});
-
-app.view('remove_reject_modal', async ({ ack, view, client }) => {
-  await ack();
-
-  const { requesterId, channel, ts } = JSON.parse(view.private_metadata);
-  const reason = view.state.values.reason_block.reason_input.value;
-
-  await client.chat.update({
-    channel,
-    ts,
-    text: `:no_entry: Rejected <@${requesterId}>'s removal request.`,
-    blocks: [
-      {
-        type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `:no_entry: Rejected <@${requesterId}>'s removal request.\n*Reason:* ${reason}`,
-        },
-      },
-    ],
-  });
-
-  await client.chat.postMessage({
-    channel: requesterId,
-    text: `Your request to remove your connected Slack account was rejected.\n*Reason:* ${reason}`,
+    text: ":white_check_mark: Your connected Slack account (token) was removed. You'll be prompted to reconnect next time it's needed for a private channel.",
   });
 });
 

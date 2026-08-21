@@ -52,7 +52,6 @@ async function reportOauthFailure(slackUserId, errorMsg) {
           'Try again with /link-bdaypheus. If it keeps failing, this has already been flagged for review.',
       });
     } catch (e) {
-      // best-effort — don't let a failed notification mask the original error
     }
   }
 
@@ -323,17 +322,41 @@ function defaultMessage(birthdayUserId, inviterId) {
   );
 }
 
-const MAX_PREVIEW_LISTED = 40;
+//fixed group and channel members
+async function computeAutoRecipients(client, { sourceChannelId, birthdayUserId, inviterId, groupIds }) {
+  const { info, members } = await fetchChannelContext(client, inviterId, sourceChannelId);
+  const allMembers = new Set(members);
+
+  for (const groupId of groupIds || []) {
+    try {
+      const groupMembers = await getUsergroupMembers(client, groupId);
+      groupMembers.forEach((id) => allMembers.add(id));
+    } catch (err) {
+      // skiping unreadable groups, send dm as fail state but probably wont happen?
+    }
+  }
+
+  const botIds = await getBotUserIds(client, [...allMembers]);
+  const recipients = [...allMembers].filter(
+    (id) => id !== birthdayUserId && id !== inviterId && !botIds.has(id)
+  );
+
+  return { recipients, sourceChannelName: info.channel.name };
+}
 
 function buildFormBlocks({
   sourceChannelId,
   birthdayUserId,
   destChannelId,
-  groupId,
+  groupIds = [],
   messageInput,
   inviterId,
   usergroupOptions = [],
+  recipientIds = [],
+  autoRecipients = [],
 }) {
+  const effectiveRecipients = recipientIds.length ? recipientIds : autoRecipients;
+
   return [
     {
       type: 'section',
@@ -341,7 +364,7 @@ function buildFormBlocks({
         type: 'mrkdwn',
         text:
           'This will DM everyone in the channel you pick below (except the birthday ' +
-          'person) with an invite. Anyone who accepts gets added to the planning channel you designate.',
+          'person) with an invite! Anyone who accepts will get added to the planning channel you designate.',
       },
     },
     {
@@ -362,16 +385,16 @@ function buildFormBlocks({
           {
             type: 'input',
             block_id: 'group_block',
-            label: { type: 'plain_text', text: 'Also invite this group (optional)' },
+            label: { type: 'plain_text', text: 'Also invite these groups' },
             optional: true,
             dispatch_action: true,
             element: {
-              type: 'external_select',
+              type: 'multi_external_select',
               action_id: 'group_select',
               placeholder: { type: 'plain_text', text: 'Type to search groups…' },
               min_query_length: 0,
-              ...(groupId
-                ? { initial_option: usergroupOptions.find((o) => o.value === groupId) }
+              ...(groupIds.length
+                ? { initial_options: usergroupOptions.filter((o) => groupIds.includes(o.value)) }
                 : {}),
             },
           },
@@ -405,13 +428,14 @@ function buildFormBlocks({
       block_id: 'message_block',
       label: { type: 'plain_text', text: 'Message to send' },
       optional: true,
+      dispatch_action: true,
       element: {
         type: 'plain_text_input',
         action_id: 'message_input',
         multiline: true,
         placeholder: {
           type: 'plain_text',
-          text: 'Fills in automatically once you pick who this is for — feel free to edit it.',
+          text: 'Fills in automatically once you pick who this is for! Feel free to edit it.',
         },
         ...(messageInput
           ? { initial_value: messageInput }
@@ -420,46 +444,46 @@ function buildFormBlocks({
           : {}),
       },
     },
+
+    ...(sourceChannelId
+      ? [
+          {
+            type: 'input',
+            block_id: 'recipients_block',
+            label: { type: 'plain_text', text: 'People to invite (add or remove anyone)' },
+            optional: true,
+            element: {
+              type: 'multi_users_select',
+              action_id: 'recipients_select',
+              placeholder: { type: 'plain_text', text: 'Auto-filled from the channel/groups above' },
+              ...(effectiveRecipients.length ? { initial_users: effectiveRecipients } : {}),
+            },
+          },
+        ]
+      : []),
   ];
 }
 
 // no tweeking okease
 const notifiedAccessFailures = new Set();
 
-async function buildPreviewBlocks(
+async function buildPreview(
   client,
-  { sourceChannelId, birthdayUserId, inviterId, groupId, messageInput }
+  { sourceChannelId, birthdayUserId, inviterId, groupIds, messageInput }
 ) {
-  if (!sourceChannelId) return [];
+  if (!sourceChannelId) return { blocks: [], autoRecipients: [] };
 
   const blocks = [{ type: 'divider' }];
+  let autoRecipients = [];
 
   try {
-    const { info, members } = await fetchChannelContext(client, inviterId, sourceChannelId);
-    const sourceChannelName = info.channel.name;
-
-    const allMembers = new Set(members);
-    let groupMemberCount = 0;
-    if (groupId) {
-      try {
-        const groupMembers = await getUsergroupMembers(client, groupId);
-        groupMemberCount = groupMembers.length;
-        groupMembers.forEach((id) => allMembers.add(id));
-      } catch (err) {
-        blocks.push({
-          type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text: `:warning: Couldn't load that group's members (${err.data ? err.data.error : err.message}).`,
-          },
-        });
-      }
-    }
-
-    const botIds = await getBotUserIds(client, [...allMembers]);
-    const recipients = [...allMembers].filter(
-      (id) => id !== birthdayUserId && id !== inviterId && !botIds.has(id)
-    );
+    const { recipients, sourceChannelName } = await computeAutoRecipients(client, {
+      sourceChannelId,
+      birthdayUserId,
+      inviterId,
+      groupIds,
+    });
+    autoRecipients = recipients;
 
     const messageText = birthdayUserId
       ? (messageInput || '').trim() || defaultMessage(birthdayUserId, inviterId)
@@ -468,25 +492,21 @@ async function buildPreviewBlocks(
     if (messageText) {
       blocks.push({
         type: 'section',
-        text: { type: 'mrkdwn', text: `*Preview: this is what recipients will receive:*\n${messageText}` },
+        text: { type: 'mrkdwn', text: `*btw, this is what recipients will receive:*\n${messageText}` },
       });
     }
 
-    const shown = recipients.slice(0, MAX_PREVIEW_LISTED);
-    const extra = recipients.length - shown.length;
-    const listText = shown.length
-      ? shown.map((id) => `• <@${id}>`).join('\n') + (extra > 0 ? `\n_...and ${extra} more_` : '')
-      : '_Nobody else to invite._';
-    const sourceLabel = groupId
-      ? `#${sourceChannelName} + the group (${groupMemberCount} members)`
-      : `#${sourceChannelName}`;
-
+    const groupNote = groupIds && groupIds.length
+      ? ` + ${groupIds.length} group${groupIds.length === 1 ? '' : 's'}`
+      : '';
     blocks.push({
-      type: 'section',
-      text: {
-        type: 'mrkdwn',
-        text: `*The following ${recipients.length} ${recipients.length === 1 ? 'person' : 'people'} will be added (from ${sourceLabel}):*\n${listText}`,
-      },
+      type: 'context',
+      elements: [
+        {
+          type: 'mrkdwn',
+          text: `Auto-filled ${recipients.length} ${recipients.length === 1 ? 'person' : 'people'} from #${sourceChannelName}${groupNote} into the list below — edit it to add or remove anyone.`,
+        },
+      ],
     });
   } catch (err) {
     const dmKey = `${inviterId}:${sourceChannelId}:${err.needsConnect ? 'connect' : 'error'}`;
@@ -572,29 +592,33 @@ async function buildPreviewBlocks(
     }
   }
 
-  return blocks;
+  return { blocks, autoRecipients };
 }
 
 function readFormState(values) {
   const groupSelect = values.group_block && values.group_block.group_select;
+  const recipientsSelect = values.recipients_block && values.recipients_block.recipients_select;
   return {
     sourceChannelId: values.source_block && values.source_block.source_select.selected_conversation,
     birthdayUserId: values.bday_block && values.bday_block.bday_select.selected_user,
     destChannelId: values.dest_block && values.dest_block.dest_select.selected_conversation,
-    groupId: groupSelect && groupSelect.selected_option && groupSelect.selected_option.value,
+    groupIds: (groupSelect && groupSelect.selected_options ? groupSelect.selected_options : []).map(
+      (o) => o.value
+    ),
+    recipientIds: (recipientsSelect && recipientsSelect.selected_users) || [],
     messageInput: values.message_block && values.message_block.message_input.value,
   };
 }
 
 async function refreshModal(body, client) {
   const inviterId = body.user.id;
-  const { sourceChannelId, birthdayUserId, destChannelId, groupId, messageInput } = readFormState(
+  const { sourceChannelId, birthdayUserId, destChannelId, groupIds, recipientIds, messageInput } = readFormState(
     body.view.state.values
   );
 
-  const [usergroupOptions, previewBlocks] = await Promise.all([
+  const [usergroupOptions, preview] = await Promise.all([
     getUsergroupOptions(client),
-    buildPreviewBlocks(client, { sourceChannelId, birthdayUserId, inviterId, groupId, messageInput }),
+    buildPreview(client, { sourceChannelId, birthdayUserId, inviterId, groupIds, messageInput }),
   ]);
 
   await client.views.update({
@@ -606,8 +630,18 @@ async function refreshModal(body, client) {
       submit: { type: 'plain_text', text: 'Send invites' },
       close: { type: 'plain_text', text: 'Cancel' },
       blocks: [
-        ...buildFormBlocks({ sourceChannelId, birthdayUserId, destChannelId, groupId, messageInput, inviterId, usergroupOptions }),
-        ...previewBlocks,
+        ...buildFormBlocks({
+          sourceChannelId,
+          birthdayUserId,
+          destChannelId,
+          groupIds,
+          messageInput,
+          inviterId,
+          usergroupOptions,
+          recipientIds,
+          autoRecipients: preview.autoRecipients,
+        }),
+        ...preview.blocks,
       ],
     },
   });
@@ -728,7 +762,11 @@ app.command('/unlink-bdaypheus', async ({ command, ack, respond }) => {
 
   await respond({
     response_type: 'ephemeral',
-    text: ":white_check_mark: Your connected Slack account (token) was removed. You'll be prompted to reconnect next time it's needed for a private channel.",
+    text:
+      ":white_check_mark: Your connected Slack account (token) was removed.\n\n" +
+      ":warning: *Heads up:* until you reconnect, I won't be able to invite people from a *private* channel " +
+      "you're not letting me read (I'll prompt you to reconnect if you try). This doesn't affect adding people " +
+      "to a private *planning* channel: that only needs me to already be a member of it, not your token.",
   });
 });
 
@@ -743,6 +781,11 @@ app.action('bday_select', async ({ ack, body, client }) => {
 });
 
 app.action('group_select', async ({ ack, body, client }) => {
+  await ack();
+  await refreshModal(body, client);
+});
+
+app.action('message_input', async ({ ack, body, client }) => {
   await ack();
   await refreshModal(body, client);
 });
@@ -780,7 +823,7 @@ app.action('view_readme', async ({ ack }) => {
 
 app.view('bday_confirm', async ({ ack, view, client, body }) => {
   const inviterId = body.user.id;
-  const { sourceChannelId, birthdayUserId, destChannelId, groupId, messageInput } = readFormState(
+  const { sourceChannelId, birthdayUserId, destChannelId, groupIds, recipientIds, messageInput } = readFormState(
     view.state.values
   );
 
@@ -796,49 +839,42 @@ app.view('bday_confirm', async ({ ack, view, client, body }) => {
 
   await ack();
 
-  let sourceChannelName;
-  let members;
-  try {
-    const ctx = await fetchChannelContext(client, inviterId, sourceChannelId);
-    sourceChannelName = ctx.info.channel.name;
-    members = ctx.members;
-  } catch (err) {
-    if (err.needsConnect) {
-      await client.chat.postMessage({
-        channel: inviterId,
-        text:
-          `:lock: <#${sourceChannelId}> is a private channel I'm not in. Connect your Slack account ` +
-          `(you'll verify with Hack Club Auth first), then run /bdaypheus again: ${buildConnectUrl(inviterId)}\n\n` +
-          `${CONSENT_WARNING}\n\nSetup docs: ${README_URL}`,
-      });
-    } else {
-      await client.chat.postMessage({
-        channel: inviterId,
-        text: `I couldn't read <#${sourceChannelId}>: ${err.data ? err.data.error : err.message}\nSetup docs: ${README_URL}`,
-      });
+  // The "People to invite" field is the actual send-list once populated —
+  // only fall back to computing it fresh if it somehow ended up empty
+  // (e.g. connect flow was interrupted before it ever got auto-filled).
+  let toMessage = recipientIds;
+  if (!toMessage.length) {
+    try {
+      const ctx = await computeAutoRecipients(client, { sourceChannelId, birthdayUserId, inviterId, groupIds });
+      toMessage = ctx.recipients;
+    } catch (err) {
+      if (err.needsConnect) {
+        await client.chat.postMessage({
+          channel: inviterId,
+          text:
+            `:lock: <#${sourceChannelId}> is a private channel I'm not in. Connect your Slack account ` +
+            `(you'll verify with Hack Club Auth first), then run /bdaypheus again: ${buildConnectUrl(inviterId)}\n\n` +
+            `${CONSENT_WARNING}\n\nSetup docs: ${README_URL}`,
+        });
+      } else {
+        await client.chat.postMessage({
+          channel: inviterId,
+          text: `I couldn't read <#${sourceChannelId}>: ${err.data ? err.data.error : err.message}\nSetup docs: ${README_URL}`,
+        });
+      }
+      return;
     }
+  }
+
+  if (!toMessage.length) {
+    await client.chat.postMessage({
+      channel: inviterId,
+      text: "There's nobody in the invite list — add someone in the \"People to invite\" field and try again.",
+    });
     return;
   }
 
   const messageText = (messageInput || '').trim() || defaultMessage(birthdayUserId, inviterId);
-
-  const allMembers = new Set(members);
-  if (groupId) {
-    try {
-      const groupMembers = await getUsergroupMembers(client, groupId);
-      groupMembers.forEach((id) => allMembers.add(id));
-    } catch (err) {
-      await client.chat.postMessage({
-        channel: inviterId,
-        text: `:warning: Couldn't load that group's members, so it was skipped (${err.data ? err.data.error : err.message}).`,
-      });
-    }
-  }
-
-  const botIds = await getBotUserIds(client, [...allMembers]);
-  const toMessage = [...allMembers].filter(
-    (id) => id !== birthdayUserId && id !== inviterId && !botIds.has(id)
-  );
 
   const buttonValue = JSON.stringify({
     dest: destChannelId,
@@ -887,7 +923,7 @@ app.view('bday_confirm', async ({ ack, view, client, body }) => {
   }
 
   const summaryLines = [
-    `:yay: Successfully sent messages to ${sent} ${sent === 1 ? 'person' : 'people'} in <#${sourceChannelId}> (#${sourceChannelName}) for <@${birthdayUserId}>'s birthday.`,
+    `:yay: Successfully sent messages to ${sent} ${sent === 1 ? 'person' : 'people'} (based on <#${sourceChannelId}>) for <@${birthdayUserId}>'s birthday.`,
   ];
   
   if (failures.length) {
